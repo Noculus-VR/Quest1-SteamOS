@@ -1,0 +1,255 @@
+# Build the public part of the SteamOS system image (holo.img.xz) on an arm64 runner.
+# UNTESTED: derived from the repo's scripts and docs/rootfs-build.md. Expect to debug the chroot stages.
+# Contains no Steam/SteamVR/gtk2 and no Meta blobs (not redistributable / only on the headset).
+name: Holo image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Also publish holo.img.xz as a prerelease
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  holo-image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends zstd xz-utils e2fsprogs curl ca-certificates
+
+      # the rootfs tarball only changes when the URL does
+      - uses: actions/cache@v4
+        with:
+          path: /var/tmp/holo-build/system.rootfs.zst
+          key: holo-rootfs-mash-20251118.3
+
+      - name: Build holo.img.xz
+        env:
+          OUT_DIR: ${{ github.workspace }}/holo-out
+        run: |
+          sudo mkdir -p /var/tmp/holo-build && sudo chown "$USER" /var/tmp/holo-build
+          cat > /tmp/build-holo.sh <<'BUILD_HOLO_EOF'
+          #!/bin/bash
+          # build-holo.sh: build the public part of the Quest1-SteamOS system image (holo.img).
+          #
+          # Runs as root on the arm64 runner (ubuntu-24.04-arm), so the Holo rootfs runs in a plain chroot
+          # with no emulation. Follows docs/rootfs-build.md ("Proposed build").
+          #
+          # UNTESTED: written from the repo's scripts and docs, never run on a headset or a runner.
+          # Expect to debug the chroot stages. See the TODO markers.
+          #
+          # What it builds: Holo Core + native-setup/firstboot + pacman packages + libhybris +
+          # bionictls + Monado (patched) + x11vnc + xscreen + SteamVR driver + Vulkan layer.
+          # What it does NOT contain (never redistributable / only on the headset, see the doc):
+          #   - Steam client, SteamVR 2.17, gtk2 (Steam Frame rootfs): copy in yourself afterwards
+          #   - Meta's Android blobs/HALs: used from the headset's own partitions at boot
+          #   - device/holo-android-*.sh need the headset's /system, so they are NOT run here
+          #
+          set -euo pipefail
+
+          [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+          [ "$(uname -m)" = aarch64 ] || { echo "needs an arm64 host (no emulation)" >&2; exit 1; }
+
+          REPO=${GITHUB_WORKSPACE:-$(pwd)}
+          OUT=$(realpath -m "${1:-$REPO/holo-out}")
+          WORK=${WORK:-/var/tmp/holo-build}
+          IMG=$WORK/holo.img
+          MNT=$WORK/mnt
+          IMG_SIZE=${IMG_SIZE:-8G}                 # sparse; shrunk at the end
+          JOBS=${JOBS:-$(nproc)}
+
+          ROOTFS_URL=${ROOTFS_URL:-https://holo-packages.steamos.cloud/holo-core-aarch64-preview/mash-20251118.3/system.rootfs.zst}
+          MONADO_REV=cfa6078b8d7f368fa5296f540a436d59833e496c
+
+          PACKAGES="base-devel git cmake meson ninja python vulkan-icd-loader vulkan-tools vulkan-headers \
+          wayland wayland-protocols libdrm libglvnd mesa-utils gdb eigen glslang shaderc libbsd hidapi libusb \
+          libxrandr libxcb openxr python-jinja strace openssh xorg-server-xvfb xorg-xwininfo xorg-xdpyinfo \
+          xorg-xauth networkmanager wpa_supplicant iw iproute2 libjpeg-turbo libpng zlib openssl libxinerama \
+          libxcursor libxdamage libxcomposite libxi xorg-xwd alsa-lib at-spi2-core libcups gdk-pixbuf2 ibus \
+          openal libpipewire libpulse libva cairo pango lsof libvdpau sdl2-compat xorg-xset"
+
+          log() { printf '\n==> %s\n' "$*"; }
+
+          need() { command -v "$1" >/dev/null || { echo "missing tool: $1 (apt install $2)" >&2; exit 1; }; }
+          need zstd zstd; need mkfs.ext4 e2fsprogs; need resize2fs e2fsprogs; need xz xz-utils; need curl curl
+
+          mkdir -p "$WORK" "$OUT" "$MNT"
+
+          cleanup() {
+            set +e
+            for m in dev/pts dev proc sys run tmp; do umount -l "$MNT/$m" 2>/dev/null; done
+            umount -l "$MNT" 2>/dev/null
+          }
+          trap cleanup EXIT
+
+          # --- 1. base image (same flags as tools/mkholo.sh: the Quest 4.4 kernel can't mount metadata_csum)
+          log "Holo Core rootfs"
+          [ -f "$WORK/system.rootfs.zst" ] || curl -fL --retry 3 -o "$WORK/system.rootfs.zst" "$ROOTFS_URL"
+
+          rm -f "$IMG"; truncate -s "$IMG_SIZE" "$IMG"
+          mkfs.ext4 -q -L holo -O ^orphan_file,^metadata_csum_seed,^metadata_csum "$IMG"
+          mount -o loop "$IMG" "$MNT"
+          zstd -dc "$WORK/system.rootfs.zst" | tar -xp --xattrs --xattrs-include='*' --numeric-owner -C "$MNT"
+          head -4 "$MNT/etc/os-release"
+
+          # --- 2. chroot plumbing -------------------------------------------------------------------
+          mount -t proc proc "$MNT/proc"
+          mount -t sysfs sysfs "$MNT/sys"
+          mount --bind /dev "$MNT/dev"; mount --bind /dev/pts "$MNT/dev/pts"
+          mount -t tmpfs tmpfs "$MNT/run"
+          mount -t tmpfs -o mode=1777 tmpfs "$MNT/tmp"
+          rm -f "$MNT/etc/resolv.conf"; printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$MNT/etc/resolv.conf"
+
+          # repo files the chroot needs
+          mkdir -p "$MNT/opt/q1src"
+          cp -a "$REPO/device" "$REPO/src" "$MNT/opt/q1src/"
+
+          in_chroot() { chroot "$MNT" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin \
+                          HOME=/root TERM=xterm LANG=C.UTF-8 JOBS="$JOBS" MONADO_REV="$MONADO_REV" /bin/bash -euo pipefail -c "$1"; }
+
+          # --- 3. firstboot + native-setup, then packages -------------------------------------------
+          log "firstboot.sh (pacman setup)"
+          # TODO: firstboot.sh ends with `curl -sI`/`pacman -Sy` checks; keyring init may need
+          #       `pacman-key --populate` on a clean Holo rootfs. Added below as best effort.
+          in_chroot 'bash /opt/q1src/device/firstboot.sh' || true
+          in_chroot 'pacman-key --populate 2>&1 | tail -3 || true'
+
+          log "pacman packages"
+          in_chroot "pacman -Syu --noconfirm --needed $PACKAGES"
+
+          log "native-setup.sh (systemd units, USB network, serial console)"
+          in_chroot 'bash /opt/q1src/device/native-setup.sh'
+
+          # --- 4. native components, built inside the image -----------------------------------------
+          log "libhybris (+ Halium android-headers, version forced to 10)"
+          in_chroot '
+          set -e
+          cd /root
+          [ -d android-headers ] || git clone --depth 1 -b halium-11.0 https://github.com/Halium/android-headers.git
+          sed -i "s/#define ANDROID_VERSION_MAJOR 11/#define ANDROID_VERSION_MAJOR 10/" android-headers/android-version.h
+          make -C android-headers install PREFIX=/opt/hybris INCLUDEDIR=/opt/hybris/include/android
+          [ -d libhybris ] || git clone https://github.com/libhybris/libhybris.git
+          cd libhybris/hybris
+          ./autogen.sh --prefix=/opt/hybris --enable-arch=arm64 --enable-adreno-quirks --enable-wayland \
+            --with-android-headers=/opt/hybris/include/android \
+            --with-default-hybris-ld-library-path=/vendor/lib64/egl:/vendor/lib64/hw:/vendor/lib64:/system/lib64:/apex/com.android.runtime/lib64/bionic
+          make -j"$JOBS" CFLAGS="-g -O2 -DVK_ENABLE_BETA_EXTENSIONS"
+          make install
+          '
+
+          log "bionictls shim"
+          # TODO: the doc says "built on the headset" without a command; this is the obvious one.
+          in_chroot '
+          mkdir -p /opt/hybris/lib
+          gcc -O2 -fPIC -shared -o /opt/hybris/lib/libbionictls.so /opt/q1src/src/bionictls/bionictls.c -ldl -lpthread
+          '
+
+          log "Monado (patched @ $MONADO_REV)"
+          # TODO: cmake flags beyond the patch's own options (XRT_BUILD_DRIVER_QUEST1, XRT_HYBRIS_AHB)
+          #       were never written down; the defaults below may need trimming (-j2 was used on-device for RAM).
+          in_chroot '
+          set -e
+          cd /root
+          [ -d monado ] || git clone https://gitlab.freedesktop.org/monado/monado.git
+          cd monado
+          git checkout -q "$MONADO_REV"
+          git apply --check /opt/q1src/src/monado/quest1-monado.patch 2>/dev/null && git apply /opt/q1src/src/monado/quest1-monado.patch
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/opt/hybris -DXRT_BUILD_DRIVER_QUEST1=ON -DXRT_HYBRIS_AHB=ON
+          ninja -C build -j"${JOBS}"
+          mkdir -p /opt/monado/bin /opt/monado/lib /opt/monado/share/openxr/1
+          '
+          # monado.service + runtime manifest (the repo script expects the tree at /root/monado/build)
+          in_chroot '
+          cp /root/monado/build/src/xrt/targets/openxr/openxr_monado-dev.json /opt/monado/share/openxr/1/openxr_monado.json 2>/dev/null \
+            || cp /root/monado/build/src/xrt/targets/openxr/openxr_monado.json /opt/monado/share/openxr/1/openxr_monado.json
+          sh /opt/q1src/device/holo-monado.sh
+          '
+
+          log "x11vnc (LibVNCServer 0.9.15 + x11vnc 0.9.17)"
+          # TODO: tarball/tag names are from memory of upstream naming; verify.
+          in_chroot '
+          set -e
+          cd /root
+          git clone --depth 1 -b LibVNCServer-0.9.15 https://github.com/LibVNC/libvncserver.git || true
+          cmake -S libvncserver -B libvncserver/build -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build libvncserver/build -j"$JOBS" && cmake --install libvncserver/build
+          git clone --depth 1 -b 0.9.17 https://github.com/LibVNC/x11vnc.git || true
+          cd x11vnc && (autoreconf -fi && ./configure --prefix=/usr/local && make -j"$JOBS" && make install)
+          '
+
+          log "xscreen"
+          # needs the OpenXR loader (pacman: openxr) and vulkan; see header comment in xscreen.c
+          in_chroot '
+          cd /opt/q1src/src/xscreen
+          gcc -O2 -o /usr/local/bin/xscreen xscreen.c gamepad.c -lopenxr_loader -lvulkan -lm
+          '
+
+          log "SteamVR driver + Vulkan layer (native build; the repo scripts assume a cross-compile in WSL)"
+          in_chroot '
+          set -e
+          cd /root
+          git clone --depth 1 https://github.com/ValveSoftware/openvr.git openvr-sdk || true
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git || true
+          git clone --depth 1 https://github.com/KhronosGroup/OpenXR-SDK.git || true
+          # build.sh files hardcode aarch64-linux-gnu-* and /root/<sdk> paths: provide native aliases
+          for t in gcc g++ objdump; do ln -sf /usr/bin/$t /usr/local/bin/aarch64-linux-gnu-$t; done
+          sh /opt/q1src/src/steamvr-quest1/build.sh
+          sh /opt/q1src/src/vklayer-steamvr/build.sh
+          install -D /opt/q1src/src/vklayer-steamvr/libVkLayer_quest1_steamvr_compat.so /usr/local/lib/libVkLayer_quest1_steamvr_compat.so
+          install -D /opt/q1src/src/vklayer-steamvr/VkLayer_quest1_steamvr_compat.json /usr/share/vulkan/implicit_layer.d/VkLayer_quest1_steamvr_compat.json
+          D=/opt/quest1-steamvr/quest1
+          mkdir -p $D/bin/linuxarm64
+          cp -a /opt/q1src/src/steamvr-quest1/quest1/. $D/
+          '
+
+          # TODO (needs the headset, see "Still only on the headset" in the doc): /usr/local/bin/steamvr-q1,
+          #   /root/vrstart.sh, dashboard service, vrwebhelper.sh edits, steamvr.vrsettings keys,
+          #   libhybris local diff. Also device/holo-steam-session.sh / holo-wifi.sh / holo-perf.sh are
+          #   installable here but were not verified to run without the Android partitions, so they are skipped.
+
+          # --- 5. tidy, shrink, compress ---------------------------------------------------------------
+          log "clean up"
+          in_chroot 'pacman -Scc --noconfirm >/dev/null 2>&1 || true; rm -rf /root/libhybris /root/monado /root/libvncserver /root/x11vnc /root/openvr-sdk /root/Vulkan-Headers /root/OpenXR-SDK /root/android-headers /opt/q1src /var/cache/pacman/pkg/*'
+          cleanup; trap - EXIT
+
+          e2fsck -fy "$IMG" >/dev/null || true
+          resize2fs -M "$IMG" | tail -1
+          dumpe2fs -h "$IMG" 2>/dev/null | grep -E 'features'   # expect no metadata_csum
+
+          log "compress (busybox in the initramfs has unxz, not zstd)"
+          xz -T0 -6 -c "$IMG" > "$OUT/holo.img.xz"
+          ( cd "$OUT" && sha256sum holo.img.xz > SHA256SUMS.txt )
+          ls -lh "$OUT"
+          echo "done: $OUT/holo.img.xz"
+          echo "Install: copy to /data/steamos/holo.img on the headset (decompressed), then add Steam/SteamVR yourself."
+
+          BUILD_HOLO_EOF
+          chmod +x /tmp/build-holo.sh
+          sudo -E GITHUB_WORKSPACE="$GITHUB_WORKSPACE" /tmp/build-holo.sh "$OUT_DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holo-img-xz
+          path: holo-out/*
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish prerelease
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=holo-${{ github.run_number }}
+          gh release create "$TAG" holo-out/holo.img.xz holo-out/SHA256SUMS.txt --prerelease \
+            --title "holo.img build $TAG" \
+            --notes "Public part of the SteamOS image only (no Steam/SteamVR/gtk2, no Meta blobs). Untested on a headset. GitHub caps release files at 2 GiB."
