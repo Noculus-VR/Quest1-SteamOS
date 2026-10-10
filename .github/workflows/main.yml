@@ -1,5 +1,5 @@
 # Build the public part of the SteamOS system image (holo.img.xz) on an arm64 runner.
-# UNTESTED past rootfs extraction: derived from the repo's scripts and docs/rootfs-build.md.
+# UNTESTED past the libhybris install step: derived from the repo's scripts and docs/rootfs-build.md.
 # Contains no Steam/SteamVR/gtk2 and no Meta blobs (not redistributable / only on the headset).
 name: Holo image
 
@@ -153,8 +153,11 @@ jobs:
           ./autogen.sh --prefix=/opt/hybris --enable-arch=arm64 --enable-adreno-quirks --enable-wayland \
             --with-android-headers=/opt/hybris/include/android \
             --with-default-hybris-ld-library-path=/vendor/lib64/egl:/vendor/lib64/hw:/vendor/lib64:/system/lib64:/apex/com.android.runtime/lib64/bionic
-          make -j"$JOBS" CFLAGS="-g -O2 -DVK_ENABLE_BETA_EXTENSIONS"
-          make install
+          # "make all" also builds the noinst test binaries under tests/, and tests/test_audio.c
+          # fails on this gcc 15 toolchain (uses strdup() without <string.h>, no longer implicitly
+          # declared). Those binaries are not installed, so going straight to "make install" builds
+          # only the installed targets and skips that file.
+          make install -j"$JOBS" CFLAGS="-g -O2 -DVK_ENABLE_BETA_EXTENSIONS"
           '
 
           log "bionictls shim"
