@@ -1,5 +1,5 @@
 # Build the public part of the SteamOS system image (holo.img.xz) on an arm64 runner.
-# UNTESTED: derived from the repo's scripts and docs/rootfs-build.md. Expect to debug the chroot stages.
+# UNTESTED past rootfs extraction: derived from the repo's scripts and docs/rootfs-build.md.
 # Contains no Steam/SteamVR/gtk2 and no Meta blobs (not redistributable / only on the headset).
 name: Holo image
 
@@ -115,7 +115,8 @@ jobs:
           cp -a "$REPO/device" "$REPO/src" "$MNT/opt/q1src/"
 
           in_chroot() { chroot "$MNT" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin \
-                          HOME=/root TERM=xterm LANG=C.UTF-8 JOBS="$JOBS" MONADO_REV="$MONADO_REV" /bin/bash -euo pipefail -c "$1"; }
+                          HOME=/root TERM=xterm LANG=C.UTF-8 JOBS="$JOBS" MONADO_REV="$MONADO_REV" PACKAGES="$PACKAGES" \
+                          /bin/bash -euo pipefail -c "$1"; }
 
           # --- 3. firstboot + native-setup, then packages -------------------------------------------
           log "firstboot.sh (pacman setup)"
@@ -125,7 +126,16 @@ jobs:
           in_chroot 'pacman-key --populate 2>&1 | tail -3 || true'
 
           log "pacman packages"
-          in_chroot "pacman -Syu --noconfirm --needed $PACKAGES"
+          # One unresolvable target aborts pacman's *whole* transaction, even though it prints status
+          # for the others first. docs/rootfs-build.md's package list may not all exist in this repo
+          # snapshot (e.g. strace didn't on a 2026-10 run) -- install one at a time so a single missing
+          # or renamed package doesn't block the rest, and report what got skipped.
+          in_chroot 'pacman -Sy --noconfirm
+          missing=""
+          for p in $PACKAGES; do
+            pacman -S --noconfirm --needed "$p" || missing="$missing $p"
+          done
+          if [ -n "$missing" ]; then echo "SKIPPED (not found in this repo snapshot):$missing" >&2; fi'
 
           log "native-setup.sh (systemd units, USB network, serial console)"
           in_chroot 'bash /opt/q1src/device/native-setup.sh'
