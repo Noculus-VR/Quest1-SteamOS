@@ -102,6 +102,7 @@ jobs:
           head -4 "$MNT/etc/os-release"
 
           # --- 2. chroot plumbing -------------------------------------------------------------------
+          mkdir -p "$MNT"/{proc,sys,dev/pts,run,tmp}   # the rootfs tarball doesn't ship these as dirs
           mount -t proc proc "$MNT/proc"
           mount -t sysfs sysfs "$MNT/sys"
           mount --bind /dev "$MNT/dev"; mount --bind /dev/pts "$MNT/dev/pts"
